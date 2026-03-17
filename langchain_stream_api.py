@@ -128,7 +128,7 @@ class LangChainLLMService:
 
         Yields:
             流式输出的token，格式：data: [type]content\n\n
-            类型：[THINKING] 思考内容, [RESULT] 回答内容
+            类型：[THINKING] 统一流式内容（思考/回答都使用该标记）
         """
         messages = list(history)
 
@@ -260,16 +260,14 @@ async def chat_stream(request: ChatRequest):
     流式聊天接口，支持思考过程和结果区分显示
 
     SSE格式说明：
-    - [THINKING]{content} - 思考内容
-    - [RESULT]{content} - 结果内容
-    - [FULL_RESULT]{content} - 完整结果（流式结束时输出）
+    - [THINKING]{content} - 统一流式内容（思考/结果都使用该标记）
+    - [FULL_RESULT]{content} - 完整结果（流式结束时输出，基于原始 [RESULT] 内容）
     - [DONE] - 完成
     """
     session_id, session_data = session_manager.get_or_create_session(request.session_id)
 
     def generate():
         full_result = ""
-        thinking_result = ""  # 收集完整的思考内容
 
         for token in llm_service.stream_generate(
             history=session_data["history"],
@@ -277,14 +275,12 @@ async def chat_stream(request: ChatRequest):
             modifications=request.modifications,
             show_thinking=request.show_thinking
         ):
-            yield token
-            # 收集结果内容
-            if "[THINKING]" in token:
-                start_idx = token.find("[THINKING]")
-                end_idx = token.find("|||SSE|||", start_idx)
-                if start_idx != -1 and end_idx != -1:
-                    thinking_result += token[start_idx + 10:end_idx]
-            elif "[RESULT]" in token:
+            stream_token = token
+            if "[RESULT]" in stream_token:
+                stream_token = stream_token.replace("[RESULT]", "[THINKING]", 1)
+            yield stream_token
+            # 收集结果内容（保持原始 [RESULT] 内容用于 FULL_RESULT）
+            if "[RESULT]" in token:
                 start_idx = token.find("[RESULT]")
                 end_idx = token.find("|||SSE|||", start_idx)
                 if start_idx != -1 and end_idx != -1:
