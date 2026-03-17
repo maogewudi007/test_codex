@@ -168,19 +168,19 @@ class LangChainLLMService:
                         prefix, hit_tag, suffix = self._split_by_first_tag(content_buffer, self._think_open_tags)
                         if hit_tag is not None:
                             if prefix:
-                                yield f"data: [RESULT]{prefix}|||SSE|||"
+                                yield f"data: [RESULT]{prefix}\n\n"
                             in_thinking = True
                             content_buffer = suffix
                             continue
 
                         pending_len = self._pending_suffix_len(content_buffer, self._think_open_tags)
                         if pending_len == 0:
-                            yield f"data: [RESULT]{content_buffer}|||SSE|||"
+                            yield f"data: [RESULT]{content_buffer}\n\n"
                             content_buffer = ""
                         else:
                             flush_text = content_buffer[:-pending_len]
                             if flush_text:
-                                yield f"data: [RESULT]{flush_text}|||SSE|||"
+                                yield f"data: [RESULT]{flush_text}\n\n"
                             content_buffer = content_buffer[-pending_len:]
                         break
 
@@ -188,7 +188,7 @@ class LangChainLLMService:
                     prefix, hit_tag, suffix = self._split_by_first_tag(content_buffer, self._think_close_tags)
                     if hit_tag is not None:
                         if show_thinking and prefix:
-                            yield f"data: [THINKING]{prefix}|||SSE|||"
+                            yield f"data: [THINKING]{prefix}\n\n"
                         in_thinking = False
                         content_buffer = suffix
                         continue
@@ -196,12 +196,12 @@ class LangChainLLMService:
                     pending_len = self._pending_suffix_len(content_buffer, self._think_close_tags)
                     if pending_len == 0:
                         if show_thinking and content_buffer:
-                            yield f"data: [THINKING]{content_buffer}|||SSE|||"
+                            yield f"data: [THINKING]{content_buffer}\n\n"
                         content_buffer = ""
                     else:
                         flush_text = content_buffer[:-pending_len]
                         if show_thinking and flush_text:
-                            yield f"data: [THINKING]{flush_text}|||SSE|||"
+                            yield f"data: [THINKING]{flush_text}\n\n"
                         content_buffer = content_buffer[-pending_len:]
                     break
 
@@ -210,10 +210,10 @@ class LangChainLLMService:
             if in_thinking:
                 # 如果仍在思考状态（没有关闭标签），将剩余内容作为思考
                 if show_thinking:
-                    yield f"data: [THINKING]{content_buffer}|||SSE|||"
+                    yield f"data: [THINKING]{content_buffer}\n\n"
             else:
                 # 非思考状态，按回答处理
-                yield f"data: [RESULT]{content_buffer}|||SSE|||"
+                yield f"data: [RESULT]{content_buffer}\n\n"
 
 
 llm_service = LangChainLLMService()
@@ -280,16 +280,11 @@ async def chat_stream(request: ChatRequest):
                 stream_token = stream_token.replace("[RESULT]", "[THINKING]", 1)
             yield stream_token
             # 收集结果内容（保持原始 [RESULT] 内容用于 FULL_RESULT）
-            if "[RESULT]" in token:
-                start_idx = token.find("[RESULT]")
-                end_idx = token.find("|||SSE|||", start_idx)
-                if start_idx != -1 and end_idx != -1:
-                    full_result += token[start_idx + 8:end_idx]
-            elif "[FULL_RESULT]" in token:
-                start_idx = token.find("[FULL_RESULT]")
-                end_idx = token.find("|||SSE|||", start_idx)
-                if start_idx != -1 and end_idx != -1:
-                    full_result = token[start_idx + 12:end_idx]
+            payload = token[6:].strip() if token.startswith("data: ") else token.strip()
+            if payload.startswith("[RESULT]"):
+                full_result += payload[8:]
+            elif payload.startswith("[FULL_RESULT]"):
+                full_result = payload[13:]
 
         # 保存对话历史
         if request.modifications:
@@ -305,8 +300,8 @@ async def chat_stream(request: ChatRequest):
             session_data["modifications"] = []
 
         session_data["history"].append(AIMessage(content=full_result))
-        yield f"data: [FULL_RESULT]{full_result}|||SSE|||"
-        yield "data: [DONE]|||SSE|||"
+        yield f"data: [FULL_RESULT]{full_result}\n\n"
+        yield "data: [DONE]\n\n"
 
     return StreamingResponse(
         generate(),
