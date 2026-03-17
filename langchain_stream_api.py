@@ -2,7 +2,7 @@
 LangChain 流式输出与交互式调整 FastAPI 服务
 提供后端API接口供前端调用，支持思考过程区分显示
 """
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
@@ -82,6 +82,40 @@ class LangChainLLMService:
             max_tokens=4000,
         )
 
+        # 兼容不同模型输出的思考标签
+        self._think_open_tags = ("<think>", "<thinking>")
+        self._think_close_tags = ("</think>", "</thinking>")
+
+    @staticmethod
+    def _split_by_first_tag(text: str, tags: Tuple[str, ...]) -> Tuple[str, Optional[str], str]:
+        """按最先出现的标签切分文本，返回(标签前文本, 命中标签, 标签后文本)。"""
+        first_pos = -1
+        hit_tag = None
+        for tag in tags:
+            pos = text.find(tag)
+            if pos != -1 and (first_pos == -1 or pos < first_pos):
+                first_pos = pos
+                hit_tag = tag
+
+        if hit_tag is None:
+            return text, None, ""
+
+        return text[:first_pos], hit_tag, text[first_pos + len(hit_tag):]
+
+    @staticmethod
+    def _pending_suffix_len(text: str, tags: Tuple[str, ...]) -> int:
+        """返回需要保留的尾部长度（可能是标签前缀，等待下一块内容补全）。"""
+        if not text:
+            return 0
+
+        max_len = 0
+        for tag in tags:
+            upper = min(len(text), len(tag) - 1)
+            for size in range(1, upper + 1):
+                if text.endswith(tag[:size]):
+                    max_len = max(max_len, size)
+        return max_len
+
     def stream_generate(
         self,
         history: List,
@@ -123,57 +157,63 @@ class LangChainLLMService:
         # 流式生成
         content_buffer = ""  # 用于缓冲 content，处理思考内容分割
         in_thinking = False  # 是否在思考标签内
-        thinking_buffer = ""  # 思考内容缓冲区
 
         for chunk in self.llm.stream(formatted_messages):
             if chunk.content:
                 content_buffer += chunk.content
 
-                # 检查 <thinking> 标签
-                if "<thinking>" in content_buffer and not in_thinking:
-                    # 发现 <thinking> 标签，进入思考模式
-                    parts = content_buffer.split("<thinking>", 1)
-                    # 前面的部分是回答（如果有）
-                    if parts[0]:
-                        yield f"data: [RESULT]{parts[0]}|||SSE|||"
-                    in_thinking = True
-                    thinking_buffer = ""
-                    content_buffer = parts[1] if len(parts) > 1 else ""
-                    continue
+                while content_buffer:
+                    # 非思考阶段：寻找开始标签
+                    if not in_thinking:
+                        prefix, hit_tag, suffix = self._split_by_first_tag(content_buffer, self._think_open_tags)
+                        if hit_tag is not None:
+                            if prefix:
+                                yield f"data: [RESULT]{prefix}|||SSE|||"
+                            in_thinking = True
+                            content_buffer = suffix
+                            continue
 
-                # 检查 </thinking> 标签
-                if "</thinking>" in content_buffer and in_thinking:
-                    # 发现 </thinking> 标签，结束思考模式
-                    parts = content_buffer.split("</thinking>", 1)
-                    thinking_buffer += parts[0]
+                        pending_len = self._pending_suffix_len(content_buffer, self._think_open_tags)
+                        if pending_len == 0:
+                            yield f"data: [RESULT]{content_buffer}|||SSE|||"
+                            content_buffer = ""
+                        else:
+                            flush_text = content_buffer[:-pending_len]
+                            if flush_text:
+                                yield f"data: [RESULT]{flush_text}|||SSE|||"
+                            content_buffer = content_buffer[-pending_len:]
+                        break
 
-                    # 发送完整的思考内容
-                    if show_thinking and thinking_buffer:
-                        yield f"data: [THINKING]{thinking_buffer}|||SSE|||"
+                    # 思考阶段：寻找结束标签
+                    prefix, hit_tag, suffix = self._split_by_first_tag(content_buffer, self._think_close_tags)
+                    if hit_tag is not None:
+                        if show_thinking and prefix:
+                            yield f"data: [THINKING]{prefix}|||SSE|||"
+                        in_thinking = False
+                        content_buffer = suffix
+                        continue
 
-                    in_thinking = False
-                    thinking_buffer = ""
-                    content_buffer = parts[1] if len(parts) > 1 else ""
-                    continue
-
-                # 根据当前状态处理内容
-                if in_thinking:
-                    # 在思考标签内，继续累积思考内容
-                    thinking_buffer += content_buffer
-                    content_buffer = ""
-                else:
-                    # 在回答阶段，发送结果内容
-                    yield f"data: [RESULT]{content_buffer}|||SSE|||"
-                    content_buffer = ""
+                    pending_len = self._pending_suffix_len(content_buffer, self._think_close_tags)
+                    if pending_len == 0:
+                        if show_thinking and content_buffer:
+                            yield f"data: [THINKING]{content_buffer}|||SSE|||"
+                        content_buffer = ""
+                    else:
+                        flush_text = content_buffer[:-pending_len]
+                        if show_thinking and flush_text:
+                            yield f"data: [THINKING]{flush_text}|||SSE|||"
+                        content_buffer = content_buffer[-pending_len:]
+                    break
 
         # 处理缓冲区中剩余的内容（流式结束时的收尾）
-        if in_thinking and (thinking_buffer or content_buffer):
-            # 如果仍在思考状态（没有 </thinking>），将所有内容作为思考
-            if show_thinking:
-                yield f"data: [THINKING]{thinking_buffer + content_buffer}|||SSE|||"
-        elif content_buffer:
-            # 否则作为回答
-            yield f"data: [RESULT]{content_buffer}|||SSE|||"
+        if content_buffer:
+            if in_thinking:
+                # 如果仍在思考状态（没有关闭标签），将剩余内容作为思考
+                if show_thinking:
+                    yield f"data: [THINKING]{content_buffer}|||SSE|||"
+            else:
+                # 非思考状态，按回答处理
+                yield f"data: [RESULT]{content_buffer}|||SSE|||"
 
 
 llm_service = LangChainLLMService()
