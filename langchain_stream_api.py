@@ -116,6 +116,14 @@ class LangChainLLMService:
                     max_len = max(max_len, size)
         return max_len
 
+
+    @staticmethod
+    def _format_sse_event(payload: str) -> str:
+        """将任意 payload 编码为标准 SSE data 事件，避免内容中的\n\n破坏分帧。"""
+
+        lines = payload.split("\n")
+        return "".join(f"data: {line}\n" for line in lines) + "\n"
+
     def stream_generate(
         self,
         history: List,
@@ -168,19 +176,19 @@ class LangChainLLMService:
                         prefix, hit_tag, suffix = self._split_by_first_tag(content_buffer, self._think_open_tags)
                         if hit_tag is not None:
                             if prefix:
-                                yield f"data: [RESULT]{prefix}\n\n"
+                                yield self._format_sse_event(f"[RESULT]{prefix}")
                             in_thinking = True
                             content_buffer = suffix
                             continue
 
                         pending_len = self._pending_suffix_len(content_buffer, self._think_open_tags)
                         if pending_len == 0:
-                            yield f"data: [RESULT]{content_buffer}\n\n"
+                            yield self._format_sse_event(f"[RESULT]{content_buffer}")
                             content_buffer = ""
                         else:
                             flush_text = content_buffer[:-pending_len]
                             if flush_text:
-                                yield f"data: [RESULT]{flush_text}\n\n"
+                                yield self._format_sse_event(f"[RESULT]{flush_text}")
                             content_buffer = content_buffer[-pending_len:]
                         break
 
@@ -188,7 +196,7 @@ class LangChainLLMService:
                     prefix, hit_tag, suffix = self._split_by_first_tag(content_buffer, self._think_close_tags)
                     if hit_tag is not None:
                         if show_thinking and prefix:
-                            yield f"data: [THINKING]{prefix}\n\n"
+                            yield self._format_sse_event(f"[THINKING]{prefix}")
                         in_thinking = False
                         content_buffer = suffix
                         continue
@@ -196,12 +204,12 @@ class LangChainLLMService:
                     pending_len = self._pending_suffix_len(content_buffer, self._think_close_tags)
                     if pending_len == 0:
                         if show_thinking and content_buffer:
-                            yield f"data: [THINKING]{content_buffer}\n\n"
+                            yield self._format_sse_event(f"[THINKING]{content_buffer}")
                         content_buffer = ""
                     else:
                         flush_text = content_buffer[:-pending_len]
                         if show_thinking and flush_text:
-                            yield f"data: [THINKING]{flush_text}\n\n"
+                            yield self._format_sse_event(f"[THINKING]{flush_text}")
                         content_buffer = content_buffer[-pending_len:]
                     break
 
@@ -210,10 +218,10 @@ class LangChainLLMService:
             if in_thinking:
                 # 如果仍在思考状态（没有关闭标签），将剩余内容作为思考
                 if show_thinking:
-                    yield f"data: [THINKING]{content_buffer}\n\n"
+                    yield self._format_sse_event(f"[THINKING]{content_buffer}")
             else:
                 # 非思考状态，按回答处理
-                yield f"data: [RESULT]{content_buffer}\n\n"
+                yield self._format_sse_event(f"[RESULT]{content_buffer}")
 
 
 llm_service = LangChainLLMService()
@@ -269,6 +277,13 @@ async def chat_stream(request: ChatRequest):
     def generate():
         full_result = ""
 
+        def _extract_sse_payload(event: str) -> str:
+            data_parts = []
+            for line in event.splitlines():
+                if line.startswith("data:"):
+                    data_parts.append(line[5:].lstrip())
+            return "\n".join(data_parts)
+
         for token in llm_service.stream_generate(
             history=session_data["history"],
             user_input=request.message if not request.modifications else None,
@@ -280,7 +295,7 @@ async def chat_stream(request: ChatRequest):
                 stream_token = stream_token.replace("[RESULT]", "[THINKING]", 1)
             yield stream_token
             # 收集结果内容（保持原始 [RESULT] 内容用于 FULL_RESULT）
-            payload = token[6:].strip() if token.startswith("data: ") else token.strip()
+            payload = _extract_sse_payload(token)
             if payload.startswith("[RESULT]"):
                 full_result += payload[8:]
             elif payload.startswith("[FULL_RESULT]"):
@@ -300,8 +315,8 @@ async def chat_stream(request: ChatRequest):
             session_data["modifications"] = []
 
         session_data["history"].append(AIMessage(content=full_result))
-        yield f"data: [FULL_RESULT]{full_result}\n\n"
-        yield "data: [DONE]\n\n"
+        yield llm_service._format_sse_event(f"[FULL_RESULT]{full_result}")
+        yield llm_service._format_sse_event("[DONE]")
 
     return StreamingResponse(
         generate(),
