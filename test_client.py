@@ -2,26 +2,51 @@
 LangChain Stream API 测试客户端
 使用 Python 调用 FastAPI 服务，支持思考过程区分显示
 """
-import requests
 import uuid
-from typing import Optional
+from typing import Iterator, Optional
+
+import requests
 
 API_BASE = "http://localhost:8000"
+REQUEST_TIMEOUT = 30
 
 
 def test_health():
     """测试健康检查"""
     print("\n=== 健康检查 ===")
-    response = requests.get(f"{API_BASE}/api/health")
+    response = requests.get(f"{API_BASE}/api/health", timeout=REQUEST_TIMEOUT)
     print(f"状态码: {response.status_code}")
     print(f"响应: {response.json()}")
 
 
+def iter_sse_data(response: requests.Response) -> Iterator[str]:
+    """按标准 SSE 格式解析响应，逐条返回 data 字段内容。"""
+    event_lines = []
+    for raw_line in response.iter_lines(decode_unicode=True):
+        line = raw_line if raw_line is not None else ""
+        if line == "":
+            if event_lines:
+                data_parts = [l[5:].lstrip() for l in event_lines if l.startswith("data:")]
+                if data_parts:
+                    yield "\n".join(data_parts)
+                event_lines = []
+            continue
+
+        if line.startswith(":"):
+            continue
+        event_lines.append(line)
+
+    if event_lines:
+        data_parts = [l[5:].lstrip() for l in event_lines if l.startswith("data:")]
+        if data_parts:
+            yield "\n".join(data_parts)
+
+
 def chat_stream(
     session_id: str,
-    message: str = None,
-    modifications: list = None,
-    show_thinking: bool = True
+    message: Optional[str] = None,
+    modifications: Optional[list] = None,
+    show_thinking: bool = True,
 ):
     """
     流式聊天，支持思考过程区分显示
@@ -44,68 +69,42 @@ def chat_stream(
             "session_id": session_id,
             "message": message,
             "modifications": modifications,
-            "show_thinking": show_thinking
+            "show_thinking": show_thinking,
         },
-        stream=True
+        stream=True,
+        timeout=REQUEST_TIMEOUT,
     )
+    response.raise_for_status()
 
     result_content = ""
-    thinking_content = ""  # 用于收集完整的思考内容
-    in_thinking = False
-    in_result = False
+    thinking_content = ""
 
+    for data in iter_sse_data(response):
+        if data == "[DONE]":
+            break
 
-    # 流式读取字节流，使用自定义分隔符
-    buffer = ""
-    for chunk in response.iter_content(chunk_size=1024, decode_unicode=False):
-        if chunk:
+        if data.startswith("[THINKING]"):
+            content = data[10:]
+            thinking_content += content
+            if show_thinking:
+                print(content, end="", flush=True)
+            continue
 
-            buffer += chunk.decode('utf-8', errors='ignore')
+        if data.startswith("[RESULT]"):
+            content = data[8:]
+            result_content += content
+            print(content, end="", flush=True)
+            continue
 
-            # 按 |||SSE||| 分割消息（自定义分隔符）
-            while "|||SSE|||" in buffer:
-                message, buffer = buffer.split("|||SSE|||", 1)
-
-                # 移除 "data: " 前缀
-                if message.startswith("data: "):
-                    data = message[6:]
-                elif message.startswith("data:"):
-                    data = message[5:]
-                else:
-                    continue  # 跳过非 data: 开头的消息
-
-
-                # 处理各种标记
-                if data == "[DONE]":
-                    break
-
-                # 处理思考内容
-                if data.startswith("[THINKING]"):
-                    content = data[10:]
-                    thinking_content += content
-                    if show_thinking:
-                        print(content, end='', flush=True)
-                    continue
-
-                # 处理回答内容
-                if data.startswith("[RESULT]"):
-                    content = data[8:]
-                    result_content += content
-                    print(content, end='', flush=True)
-                    continue
-
-                # 处理完整回答
-                if data.startswith("[FULL_RESULT]"):
-                    result_content = data[len("[FULL_RESULT]"):]
-                    print("\n" + "-" * 60)
-                    print("📋 完整回答:")
-                    print("-" * 60)
-                    print(result_content)
-                    print("-" * 60)
-                    # 打印摘要信息
-                    print(f"DEBUG: think 长度: {len(thinking_content)} 字符")
-                    print(f"DEBUG: content 长度: {len(result_content)} 字符")
-                    continue
+        if data.startswith("[FULL_RESULT]"):
+            result_content = data[13:]
+            print("\n" + "-" * 60)
+            print("📋 完整回答:")
+            print("-" * 60)
+            print(result_content)
+            print("-" * 60)
+            print(f"DEBUG: think 长度: {len(thinking_content)} 字符")
+            print(f"DEBUG: content 长度: {len(result_content)} 字符")
 
     print()
     return result_content
@@ -116,7 +115,8 @@ def reset_session(session_id: str):
     print("\n=== 重置会话 ===")
     response = requests.post(
         f"{API_BASE}/api/reset",
-        json={"session_id": session_id}
+        json={"session_id": session_id},
+        timeout=REQUEST_TIMEOUT,
     )
     print(f"状态码: {response.status_code}")
     print(f"响应: {response.json()}")
@@ -125,7 +125,7 @@ def reset_session(session_id: str):
 def get_session_info(session_id: str):
     """获取会话信息"""
     print(f"\n=== 会话信息: {session_id} ===")
-    response = requests.get(f"{API_BASE}/api/session/{session_id}")
+    response = requests.get(f"{API_BASE}/api/session/{session_id}", timeout=REQUEST_TIMEOUT)
     if response.status_code == 200:
         info = response.json()
         print(f"消息数量: {info['message_count']}")
@@ -176,7 +176,7 @@ def manual_mode():
         print("请先运行: python langchain_stream_api.py")
         return
 
-    show_thinking = input("\n是否显示思考过程? (y/n, 默认y): ").lower() != 'n'
+    show_thinking = input("\n是否显示思考过程? (y/n, 默认y): ").lower() != "n"
 
     session_id = str(uuid.uuid4())
     print(f"\n会话ID: {session_id}")
@@ -192,26 +192,26 @@ def manual_mode():
         if not cmd:
             continue
 
-        if cmd.lower() == 'exit':
+        if cmd.lower() == "exit":
             break
 
-        if cmd.lower() == 'reset':
+        if cmd.lower() == "reset":
             reset_session(session_id)
             modifications = []
             session_id = str(uuid.uuid4())
             print(f"新会话ID: {session_id}")
             continue
 
-        if cmd.lower() == 'info':
+        if cmd.lower() == "info":
             get_session_info(session_id)
             continue
 
-        if cmd.lower() == 'toggle':
+        if cmd.lower() == "toggle":
             show_thinking = not show_thinking
             print(f"思考过程显示已{'开启' if show_thinking else '关闭'}")
             continue
 
-        is_modification = input("这是调整指令吗? (y/n): ").lower() == 'y'
+        is_modification = input("这是调整指令吗? (y/n): ").lower() == "y"
 
         if is_modification:
             modifications.append(cmd)
@@ -231,7 +231,8 @@ if __name__ == "__main__":
             show_thinking = len(sys.argv) < 3 or sys.argv[2] != "--no-thinking"
             interactive_demo(show_thinking)
         elif sys.argv[1] == "--help":
-            print("""
+            print(
+                """
                 用法:
                 python test_client.py                  # 手动模式（默认显示思考过程）
                 python test_client.py --demo            # 演示模式（显示思考过程）
@@ -244,6 +245,7 @@ if __name__ == "__main__":
                 toggle      - 切换思考过程显示
                 <消息>      - 发送普通消息
                 <调整指令>  - 发送调整指令
-            """)
+            """
+            )
     else:
         manual_mode()
